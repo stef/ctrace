@@ -120,91 +120,90 @@ static void scan_cb(const bt_addr_le_t *addr, s8_t rssi, u8_t adv_type, struct n
 // a new day, a new SK
 // SK = SHA256(SK)
 static int next_sk(u8_t *SK) {
-	struct tc_sha256_state_struct ctx;
-   tc_sha256_init(&ctx);
-	if(TC_CRYPTO_FAIL==tc_sha256_update (&ctx, SK, 32)) {
-		LOG_ERR("failed to gen next SK (update)");
-		return -1;
-	}
-	if(TC_CRYPTO_FAIL==tc_sha256_final(SK, &ctx)) {
-		LOG_ERR("failed to gen next SK (final)");
-		return -1;
-	}
-	return 0;
+  struct tc_sha256_state_struct ctx;
+  tc_sha256_init(&ctx);
+  if(TC_CRYPTO_FAIL==tc_sha256_update (&ctx, SK, 32)) {
+    LOG_ERR("failed to gen next SK (update)");
+    return -1;
+  }
+  if(TC_CRYPTO_FAIL==tc_sha256_final(SK, &ctx)) {
+    LOG_ERR("failed to gen next SK (final)");
+    return -1;
+  }
+  return 0;
 }
 
 // tag is derived from SK and used as key in the AESCTR DBRG
 // tag = HMAC-SHA256(SK, "broadcast key")
 static int get_tag(const u8_t *SK, u8_t *tag) {
-	struct tc_hmac_state_struct ctx;
-	if(TC_CRYPTO_FAIL==tc_hmac_set_key(&ctx, SK, 32)) {
-	   LOG_ERR("failed to set key of HMAC");
-		return -1;
-	}
-	if(TC_CRYPTO_FAIL==tc_hmac_init(&ctx)) {
-	   LOG_ERR("failed to init HMAC");
-		return -1;
-	}
-	if(TC_CRYPTO_FAIL==tc_hmac_update (&ctx, "broadcast key", 13)) {
-		LOG_ERR("failed to hmac (update)");
-		return -1;
-	}
-	if(TC_CRYPTO_FAIL==tc_hmac_final(tag, TC_SHA256_DIGEST_SIZE, &ctx)) {
-		LOG_ERR("failed to hmac (final)");
-		return -1;
-	}
-	return 0;
+  struct tc_hmac_state_struct ctx;
+  if(TC_CRYPTO_FAIL==tc_hmac_set_key(&ctx, SK, 32)) {
+    LOG_ERR("failed to set key of HMAC");
+    return -1;
+  }
+  if(TC_CRYPTO_FAIL==tc_hmac_init(&ctx)) {
+    LOG_ERR("failed to init HMAC");
+    return -1;
+  }
+  if(TC_CRYPTO_FAIL==tc_hmac_update (&ctx, "broadcast key", 13)) {
+    LOG_ERR("failed to hmac (update)");
+    return -1;
+  }
+  if(TC_CRYPTO_FAIL==tc_hmac_final(tag, TC_SHA256_DIGEST_SIZE, &ctx)) {
+    LOG_ERR("failed to hmac (final)");
+    return -1;
+  }
+  return 0;
 }
 
 // get_ephid implements the PRG which derives the ith ephid using AES CTR
 // ephid_i = AESCTR(tag, i)
 static int get_ephid(const u8_t *tag, const u32_t i, u8_t *ephid) {
-   u8_t ctr[16]={0};
-   memcpy(ctr+12,&i,4);
-   if(0!=bt_encrypt_le(tag, ctr, ephid)) {
-		LOG_ERR("failed to aes-ctr ephid");
-		return -1;
-	}
-	return 0;
+  u8_t ctr[16]={0};
+  memcpy(ctr+12,&i,4);
+  if(0!=bt_encrypt_le(tag, ctr, ephid)) {
+    LOG_ERR("failed to aes-ctr ephid");
+    return -1;
+  }
+  return 0;
 }
 
 // we don't really need this function, for dev/debug purposes only
 // copy from zephr samples
 // todo remove from production code
-static int lsdir(const char *path)
-{
-   int res;
-   struct fs_dir_t dirp;
-   static struct fs_dirent entry;
+static int lsdir(const char *path) {
+  int res;
+  struct fs_dir_t dirp;
+  static struct fs_dirent entry;
 
-   /* Verify fs_opendir() */
-   res = fs_opendir(&dirp, path);
-   if (res) {
-      LOG_ERR("Error opening dir %s [%d]", path, res);
-      return res;
-   }
+  /* Verify fs_opendir() */
+  res = fs_opendir(&dirp, path);
+  if (res) {
+    LOG_ERR("Error opening dir %s [%d]", path, res);
+    return res;
+  }
 
-   LOG_INF("Listing dir %s ...", path);
-   for (;;) {
-      /* Verify fs_readdir() */
-      res = fs_readdir(&dirp, &entry);
+  LOG_INF("Listing dir %s ...", path);
+  for (;;) {
+    /* Verify fs_readdir() */
+    res = fs_readdir(&dirp, &entry);
 
-      /* entry.name[0] == 0 means end-of-dir */
-      if (res || entry.name[0] == 0) {
-         break;
-      }
+    /* entry.name[0] == 0 means end-of-dir */
+    if (res || entry.name[0] == 0) {
+      break;
+    }
 
-      if (entry.type == FS_DIR_ENTRY_DIR) {
-        LOG_INF("[DIR ] %s", entry.name);
-      } else {
-        LOG_INF("[FILE] %s (size = %zu)", log_strdup(entry.name), entry.size);
-      }
-   }
+    if (entry.type == FS_DIR_ENTRY_DIR) {
+      LOG_INF("[DIR ] %s", entry.name);
+    } else {
+      LOG_INF("[FILE] %s (size = %zu)", log_strdup(entry.name), entry.size);
+    }
+  }
 
-   /* Verify fs_closedir() */
-   fs_closedir(&dirp);
+  /* Verify fs_closedir() */
+  fs_closedir(&dirp);
 
-   return res;
+  return res;
 }
 
 void main(void) {
