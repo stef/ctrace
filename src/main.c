@@ -1,7 +1,7 @@
 /* main.c - Application main entry point */
 
 /*
- * Copyright (c) 2015-2016 Intel Corporation
+ * Copyright (c) 2020 stf
  *
  * SPDX-License-Identifier: Apache-2.0
  */
