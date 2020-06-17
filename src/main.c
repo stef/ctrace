@@ -15,11 +15,6 @@
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/hci.h>
 
-#include <tinycrypt/sha256.h>
-#include <tinycrypt/hmac.h>
-#include <bluetooth/crypto.h>
-#include <tinycrypt/constants.h>
-
 #include <disk/disk_access.h>
 #include <logging/log.h>
 #include <fs/fs.h>
@@ -28,30 +23,34 @@
 #include <devicetree.h>
 #include <drivers/gpio.h>
 
-LOG_MODULE_REGISTER(main);
+#include <shell/shell.h>
 
-#define DP3T_EPOCH 1
-// how many times we run the main loop before advancing the ephid
-#define RESEND_EPHIDS 20
+#include <stdlib.h>
+#include <posix/time.h>
+#include <time.h>
+
+#include "dp3t.h"
+
+LOG_MODULE_REGISTER(main);
 
 // led0 on when advertizing
 #define LED0_NODE DT_ALIAS(led0)
 #define LED0   DT_GPIO_LABEL(LED0_NODE, gpios)
-#define LED0_PIN DT_GPIO_PIN(LED0_NODE, gpios)
+#define TXLED_PIN DT_GPIO_PIN(LED0_NODE, gpios)
 #if DT_PHA_HAS_CELL(LED0_NODE, gpios, flags)
-#define LED0_FLAGS  DT_GPIO_FLAGS(LED0_NODE, gpios)
+#define TXLED_FLAGS  DT_GPIO_FLAGS(LED0_NODE, gpios)
 #else
-#define LED0_FLAGS 0
+#define TXLED_FLAGS 0
 #endif
 
 // led1 on when receiving ephid
 #define LED1_NODE DT_ALIAS(led1)
 #define LED1   DT_GPIO_LABEL(LED1_NODE, gpios)
-#define LED1_PIN DT_GPIO_PIN(LED1_NODE, gpios)
+#define RXLED_PIN DT_GPIO_PIN(LED1_NODE, gpios)
 #if DT_PHA_HAS_CELL(LED1_NODE, gpios, flags)
-#define LED1_FLAGS  DT_GPIO_FLAGS(LED1_NODE, gpios)
+#define RXLED_FLAGS  DT_GPIO_FLAGS(LED1_NODE, gpios)
 #else
-#define LED1_FLAGS 0
+#define RXLED_FLAGS 0
 #endif
 
 // mutex so we can fsync the logfile in the main thread
@@ -59,7 +58,7 @@ LOG_MODULE_REGISTER(main);
 K_MUTEX_DEFINE(lf_mutex);
 
 // led1 is initialized in main but used in scan_cb
-struct device *led1_dev;
+struct device *rxled;
 
 static FATFS fat_fs;
 /* mounting info */
@@ -67,15 +66,16 @@ static struct fs_mount_t mp = {
    .type = FS_FATFS,
    .fs_data = &fat_fs,
 };
-static const char *disk_mount_pt = "/SD:";
 
 // file handle for the logfile
-static struct fs_file_t logfile;
+struct fs_file_t logfile;
 // in case we don't have an sd card we skip using it
-static int have_logfile = 0;
+int have_fs = 0;
+int have_logfile = 0;
 
 // holder for our current ephid
 static u8_t mfg_data[] = { 0xc0, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+const u8_t *token = mfg_data + 2;
 
 // advertisment beacon
 static const struct bt_data ad[] = {
@@ -87,7 +87,7 @@ static void scan_cb(const bt_addr_le_t *addr, s8_t rssi, u8_t adv_type, struct n
   // only handle c019 advertisments
   if(buf->len!=0x14 || (buf->data[2]!=0xc0 && buf->data[3]!=0x19)) return;
   // rx led on
-  gpio_pin_set(led1_dev, LED1_PIN, 1);
+  gpio_pin_set(rxled, RXLED_PIN, 1);
   // only needed for devel/debug log on uart
   u8_t name[BT_ADDR_LE_STR_LEN];
   bt_addr_le_to_str(addr, name, BT_ADDR_LE_STR_LEN);
@@ -96,7 +96,7 @@ static void scan_cb(const bt_addr_le_t *addr, s8_t rssi, u8_t adv_type, struct n
          buf->data[11], buf->data[12], buf->data[13], buf->data[14], buf->data[15], buf->data[16], buf->data[17],
          buf->data[18], buf->data[19]);
   // if we have a logfile we dump the rssid+ephid to it.
-  if(have_logfile) {
+  if(have_fs) {
     u8_t entry[16+sizeof rssi];
     memcpy(entry, &rssi, sizeof rssi);
     memcpy(entry+sizeof rssi, buf->data+2, 16);
@@ -114,144 +114,115 @@ static void scan_cb(const bt_addr_le_t *addr, s8_t rssi, u8_t adv_type, struct n
     }
   }
   // rx led off
-  gpio_pin_set(led1_dev, LED1_PIN, 0);
+  gpio_pin_set(rxled, RXLED_PIN, 0);
 }
 
-// a new day, a new SK
-// SK = SHA256(SK)
-static int next_sk(u8_t *SK) {
-  struct tc_sha256_state_struct ctx;
-  tc_sha256_init(&ctx);
-  if(TC_CRYPTO_FAIL==tc_sha256_update (&ctx, SK, 32)) {
-    LOG_ERR("failed to gen next SK (update)");
-    return -1;
+static int cmd_ctrace_gettime(const struct shell *shell, size_t argc, char **argv) {
+  ARG_UNUSED(argc);
+  ARG_UNUSED(argv);
+
+  struct timespec tspec;
+  clock_gettime(CLOCK_REALTIME, &tspec);
+  struct tm t;
+  if(&t!=gmtime_r(&tspec.tv_sec, &t)) {
+    shell_error(shell,"cannot convert time from seconds since epoch");
+    return 1;
   }
-  if(TC_CRYPTO_FAIL==tc_sha256_final(SK, &ctx)) {
-    LOG_ERR("failed to gen next SK (final)");
-    return -1;
-  }
+  shell_print(shell, "%d-%d-%dT%d:%d:%d", 1900+t.tm_year, 1+t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
   return 0;
 }
 
-// tag is derived from SK and used as key in the AESCTR DBRG
-// tag = HMAC-SHA256(SK, "broadcast key")
-static int get_tag(const u8_t *SK, u8_t *tag) {
-  struct tc_hmac_state_struct ctx;
-  if(TC_CRYPTO_FAIL==tc_hmac_set_key(&ctx, SK, 32)) {
-    LOG_ERR("failed to set key of HMAC");
-    return -1;
+static int cmd_ctrace_settime(const struct shell *shell, size_t argc, char **argv) {
+  if(argc!=2) {
+    shell_error(shell, "Must provide seconds since unix epoch as parameter.");
+    return 1;
   }
-  if(TC_CRYPTO_FAIL==tc_hmac_init(&ctx)) {
-    LOG_ERR("failed to init HMAC");
-    return -1;
+  struct timespec tspec;
+  tspec.tv_sec = atoi(argv[1]);
+  tspec.tv_nsec = 0;
+  if(0!=clock_settime(CLOCK_REALTIME, &tspec)) {
+    shell_error(shell, "Cannot set time");
+    return 1;
   }
-  if(TC_CRYPTO_FAIL==tc_hmac_update (&ctx, "broadcast key", 13)) {
-    LOG_ERR("failed to hmac (update)");
-    return -1;
-  }
-  if(TC_CRYPTO_FAIL==tc_hmac_final(tag, TC_SHA256_DIGEST_SIZE, &ctx)) {
-    LOG_ERR("failed to hmac (final)");
-    return -1;
-  }
+
   return 0;
 }
 
-// get_ephid implements the PRG which derives the ith ephid using AES CTR
-// ephid_i = AESCTR(tag, i)
-static int get_ephid(const u8_t *tag, const u32_t i, u8_t *ephid) {
-  u8_t ctr[16]={0};
-  memcpy(ctr+12,&i,4);
-  if(0!=bt_encrypt_le(tag, ctr, ephid)) {
-    LOG_ERR("failed to aes-ctr ephid");
-    return -1;
+/* Creating subcommands (level 1 command) array for command "demo". */
+SHELL_STATIC_SUBCMD_SET_CREATE(sub_ctrace,
+        SHELL_CMD(settime, NULL, "set time command.", cmd_ctrace_settime),
+        SHELL_CMD(gettime, NULL, "get time command.", cmd_ctrace_gettime),
+        SHELL_SUBCMD_SET_END
+);
+/* Creating root (level 0) command "ctrace" without a handler */
+SHELL_CMD_REGISTER(ctrace, &sub_ctrace, "ctrace commands", NULL);
+
+static int fs_init(void) {
+  /* raw disk i/o */
+  static const char *disk_pdrv = "SD";
+  if (disk_access_init(disk_pdrv) != 0) {
+    LOG_ERR("Storage init ERROR!");
+    return 0;
   }
-  return 0;
+
+  mp.mnt_point = "/SD:";
+  // try to mount the FAT partition on the SD card
+  if (fs_mount(&mp) != FR_OK) {
+    LOG_ERR("Error mounting disk.");
+    return 0;
+  }
+  LOG_INF("Disk mounted.");
+
+  return 1;
 }
 
-// we don't really need this function, for dev/debug purposes only
-// copy from zephr samples
-// todo remove from production code
-static int lsdir(const char *path) {
-  int res;
-  struct fs_dir_t dirp;
-  static struct fs_dirent entry;
-
-  /* Verify fs_opendir() */
-  res = fs_opendir(&dirp, path);
-  if (res) {
-    LOG_ERR("Error opening dir %s [%d]", path, res);
-    return res;
+static struct device* led_init(const char *name, gpio_pin_t pin, gpio_flags_t flags) {
+  struct device *led_dev = device_get_binding(name);
+  if (led_dev == NULL) {
+    LOG_ERR("couldn't bind %s", name);
+    return NULL;
   }
-
-  LOG_INF("Listing dir %s ...", path);
-  for (;;) {
-    /* Verify fs_readdir() */
-    res = fs_readdir(&dirp, &entry);
-
-    /* entry.name[0] == 0 means end-of-dir */
-    if (res || entry.name[0] == 0) {
-      break;
-    }
-
-    if (entry.type == FS_DIR_ENTRY_DIR) {
-      LOG_INF("[DIR ] %s", entry.name);
-    } else {
-      LOG_INF("[FILE] %s (size = %zu)", log_strdup(entry.name), entry.size);
-    }
+  if(0 > gpio_pin_configure(led_dev, pin, GPIO_OUTPUT_ACTIVE | flags)) {
+    LOG_ERR("couldn't configure %s", name);
+    return NULL;
   }
+  // switch off led
+  gpio_pin_set(led_dev, pin, 0);
+  return led_dev;
+}
 
-  /* Verify fs_closedir() */
-  fs_closedir(&dirp);
-
-  return res;
+static void init_clock(struct device *txled) {
+  struct timespec t;
+  // block until time is set
+  LOG_INF("Blocking until clock is set via UART");
+  do {
+    gpio_pin_set(txled, TXLED_PIN, 1);
+    gpio_pin_set(rxled, RXLED_PIN, 0);
+    k_sleep(K_MSEC(100));
+    clock_gettime(CLOCK_REALTIME, &t);
+    gpio_pin_set(txled, TXLED_PIN, 0);
+    gpio_pin_set(rxled, RXLED_PIN, 1);
+    k_sleep(K_MSEC(100));
+  } while(t.tv_sec<1591384118);
+    gpio_pin_set(rxled, RXLED_PIN, 0);
 }
 
 void main(void) {
-  /* raw disk i/o */
-  // mostly informative, only disk_access_init is needed
-  do {
-    static const char *disk_pdrv = "SD";
-    u64_t memory_size_mb;
-    u32_t block_count;
-    u32_t block_size;
+  have_fs = fs_init();
 
-    if (disk_access_init(disk_pdrv) != 0) {
-      LOG_ERR("Storage init ERROR!");
-      break;
-    }
+  // tx led
+  struct device *txled = led_init(LED0, TXLED_PIN, TXLED_FLAGS);
+  // rx led (is global)
+  rxled = led_init(LED1, RXLED_PIN, RXLED_FLAGS);
 
-    if (disk_access_ioctl(disk_pdrv,
-                          DISK_IOCTL_GET_SECTOR_COUNT, &block_count)) {
-      LOG_ERR("Unable to get sector count");
-      break;
-    }
-    LOG_INF("Block count %u", block_count);
+  init_clock(txled);
 
-    if (disk_access_ioctl(disk_pdrv,
-                          DISK_IOCTL_GET_SECTOR_SIZE, &block_size)) {
-      LOG_ERR("Unable to get sector size");
-      break;
-    }
-    LOG_INF("Sector size %u", block_size);
-
-    memory_size_mb = (u64_t)block_count * block_size;
-    LOG_INF("Memory Size(MB) %u", (u32_t)memory_size_mb>>20);
-  } while (0);
-
-  mp.mnt_point = disk_mount_pt;
-
-  // try to mount the FAT partition on the SD card
-  int res = fs_mount(&mp);
-
-  if (res == FR_OK) {
-    LOG_INF("Disk mounted.");
-    // only for devel/debug ls the SD Card
-    lsdir(disk_mount_pt);
-    have_logfile = 1;
-  } else {
-    LOG_ERR("Error mounting disk.");
+  if(0!=dp3t_init()) {
+    LOG_ERR("failed to init dp3t");
+    return;
   }
 
+  // ble setup
   struct bt_le_scan_param scan_param = {
         .type       = BT_HCI_LE_SCAN_PASSIVE,
         .options    = BT_LE_SCAN_OPT_NONE,
@@ -260,32 +231,7 @@ void main(void) {
   };
   int err;
 
-  LOG_INF("Starting Scanner/Advertiser Demo");
-
-  u8_t SK_age=0; // counts the age of SK0 in days
-  u8_t SK0[32], SK[32];
-  // initialize SK
-  LOG_INF("Initializing SK");
-  sys_csrand_get(SK,32);
-  // make a copy of it to keep it for 14 "days"
-  memcpy(SK0,SK,32);
-
-  u8_t tag[TC_SHA256_DIGEST_SIZE];
-  // tag needs to be calculated once, after changing SK
-  LOG_INF("Initializing tag");
-  if(0!=get_tag(SK,tag)) {
-    LOG_ERR("failed to derive tag from SK");
-  }
-
-  // counter, when it reaches 0 we advance ephid
-  u32_t ephid_resend = RESEND_EPHIDS;
-  u32_t ephid_ctr = 0; // how many ephids we generated from this SK
-  u8_t *ephid = mfg_data+2; // the current ephid
-  LOG_INF("Initializing ephid");
-  if(0!=get_ephid(SK,ephid_ctr++,ephid)) {
-    LOG_ERR("failed to get ephid");
-  }
-
+  LOG_INF("Starting Bluetooth subsystem");
   /* Initialize the Bluetooth Subsystem */
   err = bt_enable(NULL);
   if (err) {
@@ -297,51 +243,18 @@ void main(void) {
 
   err = bt_le_scan_start(&scan_param, scan_cb);
   if (err) {
-    LOG_ERR("Starting scanning failed (err %d)", err);
+    LOG_ERR("Starting to scan failed (err %d)", err);
     return;
   }
-
-  // logfile is a global var so it can be used in main and scan thread
-  if(have_logfile) {
-    if(0!=fs_open(&logfile, "/SD:/dp3t.log")) {
-      LOG_ERR("Unable to open logfile");
-      have_logfile = 0;
-    } else if(0!=fs_seek(&logfile, 0, FS_SEEK_END)) {
-      LOG_ERR("Unable to seek to end of logfile");
-      have_logfile = 0;
-    }
-  }
-
-
-  // tx led
-  struct device *led0_dev;
-  led0_dev = device_get_binding(LED0);
-  if (led0_dev == NULL) {
-    LOG_ERR("couldn't bind LED0");
-  }
-  if(0 > gpio_pin_configure(led0_dev, LED0_PIN, GPIO_OUTPUT_ACTIVE | LED0_FLAGS)) {
-    LOG_ERR("couldn't configure LED0");
-  }
-
-  // rx led
-  led1_dev = device_get_binding(LED1);
-  if (led1_dev == NULL) {
-    LOG_ERR("couldn't bind LED1");
-  }
-  if(0 > gpio_pin_configure(led1_dev, LED1_PIN, GPIO_OUTPUT_ACTIVE | LED1_FLAGS)) {
-    LOG_ERR("couldn't configure LED1");
-  }
-  gpio_pin_set(led1_dev, LED1_PIN, 0);
 
   // main loop
   do {
     k_sleep(K_MSEC(1000));
     // tx led
-    gpio_pin_set(led0_dev, LED0_PIN, 1);
+    gpio_pin_set(txled, TXLED_PIN, 1);
 
     /* Start advertising */
-    err = bt_le_adv_start(BT_LE_ADV_NCONN, ad, ARRAY_SIZE(ad),
-                          NULL, 0);
+    err = bt_le_adv_start(BT_LE_ADV_NCONN, ad, ARRAY_SIZE(ad), NULL, 0);
     if (err) {
       LOG_ERR("Advertising failed to start (err %d)", err);
       return;
@@ -355,48 +268,16 @@ void main(void) {
       return;
     }
 
-    gpio_pin_set(led0_dev, LED0_PIN, 0);
+    gpio_pin_set(txled, TXLED_PIN, 0);
 
-    if(--ephid_resend==0) {
-      // did we send out (24*60/epoch ephids?
-      // then we start the next "day"
-      if(++ephid_ctr>=(24*60)/DP3T_EPOCH) {
-        LOG_INF("advancing SK");
-        ephid_ctr=0;
-        // generate next SK
-        if(0!=next_sk(SK)) {
-          LOG_ERR("failed to derive next SK");
-        }
-        // handle SK0 aging and forgeting
-        if(SK_age<14) { // oldest SK is younger than 14 days
-          LOG_INF("aging SK0");
-          SK_age++;
-        } else {
-          // forget old SK0 remember next one
-          LOG_INF("ratcheting SK0");
-          next_sk(SK0); // forget 15 day old SK, remember next one
-        }
-        // recalculate tag
-        LOG_INF("recalculating tag");
-        if(0!=get_tag(SK,tag)) {
-          LOG_ERR("failed to derive tag from SK");
-        }
-      }
-      LOG_INF("advancing ephid");
-      if(0!=get_ephid(SK,ephid_ctr++,ephid)) {
-        LOG_ERR("failed to get ephid");
-      }
-      ephid_resend = RESEND_EPHIDS;
-    }
-
-    if (k_mutex_lock(&lf_mutex, K_MSEC(100)) == 0) {
+    if (k_mutex_lock(&lf_mutex, K_MSEC(10)) == 0) {
       /* mutex successfully locked */
       if(0!=fs_sync(&logfile)) {
         LOG_ERR("Failed to sync logfile");
       }
       k_mutex_unlock(&lf_mutex);
     } else {
-      printk("Cannot lock lf mutex for syncing\n");
+      LOG_WRN("Cannot lock lf mutex for syncing");
     }
 
   } while (1);
