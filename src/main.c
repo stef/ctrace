@@ -29,7 +29,7 @@
 #include <posix/time.h>
 #include <time.h>
 
-#include "dp3t.h"
+#include <fs/fs.h>
 
 LOG_MODULE_REGISTER(main);
 
@@ -73,31 +73,64 @@ struct fs_file_t logfile;
 int have_fs = 0;
 int have_logfile = 0;
 
-// holder for our current ephid
-static u8_t mfg_data[] = { 0xc0, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-const u8_t *token = mfg_data + 2;
+
+static u8_t mfg_data[22] = { 0xfd, 0xf6, };
+u8_t *token = mfg_data + 2;
 
 // advertisment beacon
 static const struct bt_data ad[] = {
-	BT_DATA(BT_DATA_MANUFACTURER_DATA, mfg_data, 18),
+   // flags    02011a
+   BT_DATA_BYTES(BT_DATA_FLAGS, 0x1a),
+   // 16buuid  0303fdf6
+   BT_DATA_BYTES(BT_DATA_UUID16_ALL, 0xfd, 0xf6),
+   // data     1716fdf6<16rpi><4aem>
+   BT_DATA(BT_DATA_SVC_DATA16, mfg_data, sizeof mfg_data),
 };
+
+// -----------------------------------------------------------------------
+
+static void update_timer_handler(struct k_timer *dummy) {
+  LOG_INF("update timer triggered");
+  sys_csrand_get(token,20);
+}
+
+K_TIMER_DEFINE(update_timer, update_timer_handler, NULL);
+
+void init(void) {
+  LOG_INF("Initializing SS");
+  sys_csrand_get(token,20);
+
+  if(have_fs) {
+    if(0!=fs_open(&logfile, "/SD:/dp3t.log")) {
+      LOG_ERR("Unable to open logfile");
+      have_logfile = 0;
+    } else if(0!=fs_seek(&logfile, 0, FS_SEEK_END)) {
+      LOG_ERR("Unable to seek to end of logfile");
+      have_logfile = 0;
+    } else {
+      have_logfile = 1;
+    }
+  }
+}
+//----------------------------------------------------------
 
 // callback in case an advertisement is received
 static void scan_cb(const bt_addr_le_t *addr, s8_t rssi, u8_t adv_type, struct net_buf_simple *buf) {
   // only handle c019 advertisments
-  if(buf->len!=0x14 || (buf->data[2]!=0xc0 && buf->data[3]!=0x19)) return;
+  const uint8_t prefix[11]={0x02, 0x01, 0x1a, 0x03, 0x03, 0xfd, 0xf6, 0x17, 0x16, 0xfd, 0xf6};
+
+  if(buf->len!=31 || memcmp(buf->data,prefix,sizeof prefix)!=0) return;
   // rx led on
   gpio_pin_set(rxled, RXLED_PIN, 1);
   // only needed for devel/debug log on uart
   u8_t name[BT_ADDR_LE_STR_LEN];
   bt_addr_le_to_str(addr, name, BT_ADDR_LE_STR_LEN);
-  printk("type: %d rssi: %d, addr %s ephid: %x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x\n", adv_type, rssi, name,
-         buf->data[4], buf->data[5], buf->data[6], buf->data[7], buf->data[8], buf->data[9], buf->data[10],
-         buf->data[11], buf->data[12], buf->data[13], buf->data[14], buf->data[15], buf->data[16], buf->data[17],
-         buf->data[18], buf->data[19]);
+  LOG_INF("type: %d rssi: %d, addr %s", adv_type, rssi, log_strdup(name));
+  LOG_HEXDUMP_INF(buf->data, buf->len, "data");
   // if we have a logfile we dump the rssid+ephid to it.
   if(have_fs) {
     u8_t entry[16+sizeof rssi];
+    // todo check if time is set, then also store timestamp
     memcpy(entry, &rssi, sizeof rssi);
     memcpy(entry+sizeof rssi, buf->data+2, 16);
 
@@ -191,22 +224,6 @@ static struct device* led_init(const char *name, gpio_pin_t pin, gpio_flags_t fl
   return led_dev;
 }
 
-static void init_clock(struct device *txled) {
-  struct timespec t;
-  // block until time is set
-  LOG_INF("Blocking until clock is set via UART");
-  do {
-    gpio_pin_set(txled, TXLED_PIN, 1);
-    gpio_pin_set(rxled, RXLED_PIN, 0);
-    k_sleep(K_MSEC(100));
-    clock_gettime(CLOCK_REALTIME, &t);
-    gpio_pin_set(txled, TXLED_PIN, 0);
-    gpio_pin_set(rxled, RXLED_PIN, 1);
-    k_sleep(K_MSEC(100));
-  } while(t.tv_sec<1591384118);
-    gpio_pin_set(rxled, RXLED_PIN, 0);
-}
-
 void main(void) {
   have_fs = fs_init();
 
@@ -215,12 +232,7 @@ void main(void) {
   // rx led (is global)
   rxled = led_init(LED1, RXLED_PIN, RXLED_FLAGS);
 
-  init_clock(txled);
-
-  if(0!=dp3t_init()) {
-    LOG_ERR("failed to init dp3t");
-    return;
-  }
+  init();
 
   // ble setup
   struct bt_le_scan_param scan_param = {
